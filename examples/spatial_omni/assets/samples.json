@@ -1,0 +1,12 @@
+[
+  {
+    "repo_id": "dieKarotte/SO-Bench",
+    "repo_type": "dataset",
+    "revision": "94af762afee08ecea2cf0769ecc2f4de86bc3484",
+    "audio_path": "audio/test/foa_9975d396da0c90324197.wav",
+    "audio_sha256": "77a0f2482ab52d9fd1123a38600b97cdf63b1f4605ab9b95279ac3500ae0ac72",
+    "qa_path": "qa/test.jsonl",
+    "qa_id": "qa_2bde6a65e9071eb1e62f",
+    "question": "Listen to the audio clip and answer based only on what you hear. Which sound source is located to the front-right and above? Answer in one sentence."
+  }
+]
