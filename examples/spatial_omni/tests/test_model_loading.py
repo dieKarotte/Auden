@@ -26,8 +26,9 @@ def clear_source_modules(monkeypatch):
         monkeypatch.delitem(sys.modules, name, raising=False)
 
 
-@pytest.mark.parametrize("variant", ["so", "mix"])
-def test_selective_download_preserves_adjacent_release_config(tmp_path, monkeypatch, variant):
+@pytest.mark.parametrize("backbone", ["so7b", "so30b"])
+@pytest.mark.parametrize("variant,external_encoder", [("so", False), ("mix", False), ("so", True)])
+def test_selective_download_preserves_adjacent_release_config(tmp_path, monkeypatch, backbone, variant, external_encoder):
     calls = []
     hub = types.ModuleType("huggingface_hub")
     constants = types.ModuleType("huggingface_hub.constants")
@@ -46,26 +47,31 @@ def test_selective_download_preserves_adjacent_release_config(tmp_path, monkeypa
     hub.snapshot_download = snapshot_download
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     monkeypatch.setitem(sys.modules, "huggingface_hub.constants", constants)
-    config = model.read_config(EXAMPLE / "configs" / ("so7b_mix.yaml" if variant == "mix" else "so7b.yaml"))
-    checkpoint, encoder = model.resolve_checkpoint(config)
+    config = model.read_config(EXAMPLE / "configs" / (backbone + ("_mix.yaml" if variant == "mix" else ".yaml")))
+    encoder_override = tmp_path / "shared-encoder.pt" if external_encoder else None
+    if encoder_override:
+        encoder_override.write_bytes(b"placeholder")
+    checkpoint, encoder = model.resolve_checkpoint(config, encoder_checkpoint=encoder_override)
     assert len(calls) == 1
     request = calls[0]
     assert request["repo_id"] == config["repo_id"]
     assert request["revision"] == config["revision"]
     assert set(request["allow_patterns"]) == {
-        model.CHECKPOINTS[variant],
-        str(Path(model.CHECKPOINTS[variant]).parent / "train_args.json"),
-        "SO-Encoder/SO-Encoder.pt",
+        model.CHECKPOINTS[backbone][variant],
+        str(Path(model.CHECKPOINTS[backbone][variant]).parent / "train_args.json"),
+        *([] if external_encoder else ["SO-Encoder/SO-Encoder.pt"]),
     }
+    if external_encoder:
+        assert encoder == encoder_override.resolve()
     assert Path(request["local_dir"]).is_relative_to(tmp_path / "hf-cache")
     assert not checkpoint.is_symlink()
     assert (checkpoint.resolve().parent / "train_args.json").is_file()
     assert encoder.is_file()
     # Reusing an explicit local release does not make another hub request.
-    assert model.resolve_checkpoint(config, request["local_dir"]) == (checkpoint, encoder)
+    assert model.resolve_checkpoint(config, request["local_dir"], encoder_override) == (checkpoint, encoder)
     assert len(calls) == 1
     other_revision = dict(config, revision="another-revision")
-    other_checkpoint, _ = model.resolve_checkpoint(other_revision)
+    other_checkpoint, _ = model.resolve_checkpoint(other_revision, encoder_checkpoint=encoder_override)
     assert other_checkpoint != checkpoint
 
 
@@ -145,3 +151,111 @@ runpy.run_path(str(target), run_name="__main__")
     )
     assert "--config" in result.stdout
     assert "--checkpoint-dir" in result.stdout
+
+
+@pytest.mark.parametrize("base", [None, "some-org/a-30b-model"])
+def test_so30b_requires_local_base_before_source_or_download(tmp_path, monkeypatch, base):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Source or checkpoint loading must follow local base validation")
+
+    monkeypatch.setattr(model, "add_source", unexpected)
+    monkeypatch.setattr(model, "resolve_checkpoint", unexpected)
+    with pytest.raises(ValueError, match="downloaded base model directory"):
+        model.SpatialOmniModel.from_config(EXAMPLE / "configs/so30b.yaml", base_model=base)
+
+
+def test_so30b_rejects_source_without_its_entrypoint(tmp_path, monkeypatch):
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text("{}", encoding="utf-8")
+    source = source_checkout(tmp_path / "seven")
+    monkeypatch.setattr(model, "add_source", lambda _: source)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Checkpoint download must follow source branch validation")
+
+    monkeypatch.setattr(model, "resolve_checkpoint", unexpected)
+    with pytest.raises(ValueError, match="SO-30B source branch"):
+        model.SpatialOmniModel.from_config(
+            EXAMPLE / "configs/so30b.yaml", source_root=source, base_model=base,
+        )
+
+
+@pytest.mark.parametrize("backbone", ["so7b", "so30b"])
+def test_loader_return_shape_and_mono_route(tmp_path, monkeypatch, backbone):
+    source = source_checkout(tmp_path / "source")
+    entrypoint = source / model.SO30B_ENTRYPOINT
+    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    entrypoint.write_text("", encoding="utf-8")
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text("{}", encoding="utf-8")
+    checkpoint = tmp_path / "adaptation.pt"
+    encoder = tmp_path / "encoder.pt"
+    events = []
+    load_calls = []
+    fake_model = types.SimpleNamespace(
+        thinker=types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                text_config=types.SimpleNamespace(hidden_size=2048),
+            ),
+        ),
+    )
+    processor = object()
+    result = types.SimpleNamespace(missing_keys=[])
+    release = types.ModuleType("spatial_omni.utils.release")
+    release.load_release_settings = lambda *args, **kwargs: {"mixed_spatial_replay": True}
+    transformers = types.ModuleType("transformers")
+    transformers.set_seed = lambda seed: events.append(("seed", seed))
+    trainer = types.ModuleType("train_so_qa")
+    trainer.SpatialBeatsQACollator = lambda **kwargs: ("learned_null", kwargs)
+    loader = types.ModuleType("scripts.batch_bench_so_qa")
+    loader.unwrap_model = lambda instance: instance
+    loader.SpatialBeatsEvalCollator = lambda **kwargs: ("eval", kwargs)
+
+    def instantiate(runtime, path):
+        events.append(("instantiate", path))
+        load_calls.append(runtime)
+        loaded = (fake_model, processor, {}, {}, result)
+        return loaded + ({"loaded_keys": 884},) if backbone == "so30b" else loaded
+
+    loader.instantiate_model_for_checkpoint = instantiate
+    original_import = model.importlib.import_module
+
+    def import_module(name):
+        events.append(("import", name))
+        if name == model.SO30B_ENTRYPOINT[:-3].replace("/", "."):
+            return types.ModuleType(name)
+        if name == "scripts.batch_bench_so_qa":
+            return loader
+        return original_import(name)
+
+    monkeypatch.setitem(sys.modules, "spatial_omni.utils.release", release)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setitem(sys.modules, "train_so_qa", trainer)
+    monkeypatch.setattr(model, "add_source", lambda _: source)
+    monkeypatch.setattr(model, "resolve_checkpoint", lambda *args: (checkpoint, encoder))
+    monkeypatch.setattr(model.importlib, "import_module", import_module)
+    instance = model.SpatialOmniModel.from_config(
+        EXAMPLE / "configs" / f"{backbone}_mix.yaml",
+        source_root=source, base_model=base, device="cuda:1",
+    )
+    assert instance.model is fake_model
+    assert instance.processor is processor
+    assert instance.foa_collator == ("eval", {"processor": processor})
+    assert load_calls[0].device == "cuda:1"
+    assert load_calls[0].beats_checkpoint == str(encoder)
+    if backbone == "so30b":
+        assert load_calls[0].model_id == str(base.resolve())
+        wrapper = ("import", model.SO30B_ENTRYPOINT[:-3].replace("/", "."))
+        assert events.index(wrapper) < events.index(("import", "scripts.batch_bench_so_qa"))
+        assert events.index(wrapper) < events.index(("instantiate", str(checkpoint)))
+        assert instance.mono_collator == (
+            "eval", {"processor": processor, "mono_audio_zero_spatial_tokens": True,
+                     "zero_projected_spatial_dim": 2048},
+        )
+    else:
+        assert instance.mono_collator == (
+            "learned_null", {"processor": processor, "enable_mono_replay": True,
+                             "include_generation_inputs": True},
+        )

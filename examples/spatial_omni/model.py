@@ -11,9 +11,10 @@ import sys
 from data import validate_audio
 
 EXAMPLE_ROOT = Path(__file__).resolve().parent
+SO30B_ENTRYPOINT = 'scripts/bench_test_generate_qwen3.py'
 CHECKPOINTS = {
-    "so": "SO-7B/so/SO-7B.pt",
-    "mix": "SO-7B/mix/SO-7B-MIX.pt",
+    "so7b": {"so": "SO-7B/so/SO-7B.pt", "mix": "SO-7B/mix/SO-7B-MIX.pt"},
+    "so30b": {"so": "SO-30B/so/SO-30B.pt", "mix": "SO-30B/mix/SO-30B-MIX.pt"},
 }
 
 
@@ -44,10 +45,12 @@ def read_config(config_path):
         config = yaml.safe_load(stream)
     if not isinstance(config, dict):
         raise ValueError("The example config must be a YAML mapping.")
-    required = {"variant", "repo_id", "revision", "device", "dtype", "attn_impl", "max_new_tokens", "seed"}
+    required = {"backbone", "variant", "repo_id", "revision", "device", "dtype", "attn_impl", "max_new_tokens", "seed"}
     if set(config) != required:
         raise ValueError(f"Config fields must be: {', '.join(sorted(required))}")
-    if config["variant"] not in CHECKPOINTS:
+    if config["backbone"] not in CHECKPOINTS:
+        raise ValueError("backbone must be so7b or so30b.")
+    if config["variant"] not in ("so", "mix"):
         raise ValueError("variant must be so or mix.")
     if config["dtype"] not in ("bfloat16", "float16", "float32"):
         raise ValueError("dtype must be bfloat16, float16 or float32.")
@@ -60,8 +63,8 @@ def read_config(config_path):
     return config
 
 
-def resolve_checkpoint(config, checkpoint_dir=None):
-    filename = CHECKPOINTS[config["variant"]]
+def resolve_checkpoint(config, checkpoint_dir=None, encoder_checkpoint=None):
+    filename = CHECKPOINTS[config["backbone"]][config["variant"]]
     if checkpoint_dir is None:
         from huggingface_hub import snapshot_download
         from huggingface_hub.constants import HF_HOME
@@ -77,12 +80,12 @@ def resolve_checkpoint(config, checkpoint_dir=None):
             local_dir=local_dir,
             allow_patterns=[
                 filename, f"{folder}/train_args.json",
-                "SO-Encoder/SO-Encoder.pt",
+                *([] if encoder_checkpoint else ["SO-Encoder/SO-Encoder.pt"]),
             ],
         )
     root = Path(checkpoint_dir).expanduser().resolve()
     checkpoint = root / filename
-    encoder = root / "SO-Encoder/SO-Encoder.pt"
+    encoder = Path(encoder_checkpoint).expanduser().resolve() if encoder_checkpoint else root / "SO-Encoder/SO-Encoder.pt"
     for path in (checkpoint, checkpoint.parent / "train_args.json", encoder):
         if not path.is_file():
             raise FileNotFoundError(f"Missing release file: {path}. Keep the HF repository directory layout.")
@@ -94,10 +97,16 @@ class SpatialOmniModel:
 
     @classmethod
     def from_config(cls, config_path, source_root=None, checkpoint_dir=None,
-                    base_model=None, device=None):
+                    base_model=None, device=None, encoder_checkpoint=None):
         config = read_config(config_path)
-        add_source(source_root)
-        checkpoint, encoder = resolve_checkpoint(config, checkpoint_dir)
+        if config["backbone"] == "so30b":
+            if not base_model or not (Path(base_model).expanduser() / "config.json").is_file():
+                raise ValueError("SO-30B needs --base-model pointing to a downloaded base model directory.")
+            base_model = str(Path(base_model).expanduser().resolve())
+        source = add_source(source_root)
+        if config["backbone"] == "so30b" and not (source / SO30B_ENTRYPOINT).is_file():
+            raise ValueError("SO-30B needs the Spatial-Omni SO-30B source branch.")
+        checkpoint, encoder = resolve_checkpoint(config, checkpoint_dir, encoder_checkpoint)
         from spatial_omni.utils.release import load_release_settings
 
         settings = load_release_settings(
@@ -109,6 +118,8 @@ class SpatialOmniModel:
         from transformers import set_seed
 
         set_seed(config["seed"])
+        if config["backbone"] == "so30b":
+            importlib.import_module(SO30B_ENTRYPOINT[:-3].replace("/", "."))
         loader = importlib.import_module("scripts.batch_bench_so_qa")
         runtime = argparse.Namespace(
             model_id=base_model, beats_checkpoint=str(encoder),
@@ -116,10 +127,9 @@ class SpatialOmniModel:
             dtype=config["dtype"], attn_impl=config["attn_impl"],
         )
         with redirect_stdout(sys.stderr):
-            model, processor, _, state, result = loader.instantiate_model_for_checkpoint(
-                runtime, str(checkpoint),
-            )
-        del state
+            loaded = loader.instantiate_model_for_checkpoint(runtime, str(checkpoint))
+        model, processor, _, state, result = loaded[:5]
+        del state, loaded
         instance = cls()
         instance.model = model
         instance.processor = processor
@@ -129,12 +139,20 @@ class SpatialOmniModel:
         instance.foa_collator = loader.SpatialBeatsEvalCollator(processor=processor)
         instance.mono_collator = None
         if is_mix:
-            from train_so_qa import SpatialBeatsQACollator
+            if config["backbone"] == "so30b":
+                thinker_config = loader.unwrap_model(model).thinker.config
+                text_config = getattr(thinker_config, "text_config", None) or thinker_config
+                instance.mono_collator = loader.SpatialBeatsEvalCollator(
+                    processor=processor, mono_audio_zero_spatial_tokens=True,
+                    zero_projected_spatial_dim=text_config.hidden_size,
+                )
+            else:
+                from train_so_qa import SpatialBeatsQACollator
 
-            instance.mono_collator = SpatialBeatsQACollator(
-                processor=processor, enable_mono_replay=True,
-                include_generation_inputs=True,
-            )
+                instance.mono_collator = SpatialBeatsQACollator(
+                    processor=processor, enable_mono_replay=True,
+                    include_generation_inputs=True,
+                )
         logging.info("Loaded %s; %d frozen base entries omitted.",
                      checkpoint, len(result.missing_keys))
         return instance
@@ -144,7 +162,7 @@ class SpatialOmniModel:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a nonempty string.")
         if mono and not self.is_mix:
-            raise ValueError("Mono input requires the SO-7B-MIX config and checkpoint.")
+            raise ValueError("Mono input requires a MIX config and checkpoint.")
         audio = Path(audio_path).expanduser().resolve()
         info = validate_audio(audio, mono=mono)
         logging.info("Audio: %s; %.2f s, %d Hz, %d channels",
@@ -178,7 +196,8 @@ def add_model_arguments(parser):
     parser.add_argument("--config", default=str(EXAMPLE_ROOT / "configs/so7b.yaml"))
     parser.add_argument("--source-root", help="Spatial-Omni source checkout; defaults to SPATIAL_OMNI_ROOT.")
     parser.add_argument("--checkpoint-dir", help="Local HF release root; otherwise download the selected variant.")
-    parser.add_argument("--base-model", help="Local base model directory or HF ID; defaults to the release settings.")
+    parser.add_argument("--encoder-checkpoint", help="Use an SO-Encoder.pt outside the release directory.")
+    parser.add_argument("--base-model", help="Local base directory (required for SO-30B), or a model ID for SO-7B.")
     parser.add_argument("--device", help="Override the config's device, e.g. cuda:0.")
 
 
@@ -186,5 +205,5 @@ def load_model(args):
     return SpatialOmniModel.from_config(
         args.config, source_root=args.source_root,
         checkpoint_dir=args.checkpoint_dir, base_model=args.base_model,
-        device=args.device,
+        device=args.device, encoder_checkpoint=getattr(args, "encoder_checkpoint", None),
     )
