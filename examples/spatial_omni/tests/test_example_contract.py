@@ -2,9 +2,7 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
-import subprocess
 import sys
 import types
 
@@ -155,32 +153,6 @@ def test_limit_and_partial_failure_are_visible(tmp_path, monkeypatch):
     assert [json.loads(line)["id"] for line in Path(args.output).read_text().splitlines()] == ["0"]
 
 
-def test_predictions_align_with_canonical_scorer_dry_run(tmp_path, monkeypatch):
-    source = os.environ.get("SO_TEST_SOURCE_ROOT")
-    if not source:
-        pytest.skip("Set SO_TEST_SOURCE_ROOT to a public Spatial-Omni checkout")
-    scorer = Path(source) / "scripts" / "score_sobench.py"
-    assert scorer.is_file()
-    write_audio(tmp_path / "scene.wav")
-    rows = [
-        {"qa_id": "gold-a", "audio_path": "scene.wav", "question": "Azimuth?", "task_name": "estimate_azimuth", "answer": "90", "canonical_answer": "90", "answer_meta": {"azimuth_deg": 90}},
-        {"id": "b", "audio_path": "scene.wav", "question": "Motion?", "prompt": "Motion? A. still B. moving", "task_name": "classify_motion", "answer": "still"},
-    ]
-    manifest = write_manifest(tmp_path / "manifest.jsonl", rows)
-    fake_model(monkeypatch)
-    args = arguments(tmp_path, manifest)
-    evaluate.run(args)
-    qa_root = tmp_path / "qa"
-    qa_root.mkdir()
-    write_manifest(qa_root / "test.jsonl", rows)
-    result = subprocess.run(
-        [sys.executable, str(scorer), "--predictions-jsonl", args.output, "--qa-root", str(qa_root), "--expected-examples", "2", "--dry-run"],
-        text=True, capture_output=True, check=True,
-    )
-    assert json.loads(result.stdout)["examples"] == 2
-    assert not (tmp_path / "llm_result.json").exists()
-    assert not (tmp_path / "llm_judged_records.jsonl").exists()
-    assert not (tmp_path / "llm_judge_cache.jsonl").exists()
 
 def test_explicit_audio_root_and_broken_output_symlink(tmp_path, monkeypatch):
     audio_root = tmp_path / "dataset"

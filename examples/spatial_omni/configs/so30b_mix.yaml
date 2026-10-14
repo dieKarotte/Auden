@@ -7,3 +7,4 @@ dtype: bfloat16
 attn_impl: sdpa
 max_new_tokens: 96
 seed: 1234
+base_revision: 26291f793822fb6be9555850f06dfe95f2d7e695
