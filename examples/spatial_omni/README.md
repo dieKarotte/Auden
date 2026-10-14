@@ -2,10 +2,7 @@
 
 [Paper](https://arxiv.org/abs/2606.10738) · [Checkpoints](https://huggingface.co/dieKarotte/Spatial-Omni) · [SO-Bench](https://huggingface.co/datasets/dieKarotte/SO-Bench)
 
-Spatial-Omni answers questions about sounds and their spatial relationships.
-SO-Encoder extracts spatial features from four-channel first-order ambisonic
-(FOA) audio alongside the base model's audio encoder. This example includes
-SO-7B and SO-30B, with their SO and MIX checkpoints.
+Spatial-Omni answers questions about sounds and their spatial relationships. SO-Encoder extracts spatial features from four-channel first-order ambisonic (FOA) audio alongside the base model's audio encoder. This example includes SO-7B and SO-30B, with their SO and MIX checkpoints.
 
 ## Installation
 
@@ -50,21 +47,15 @@ The default model is SO-7B. Select another checkpoint with `--config`:
 | SO-30B | `configs/so30b.yaml` |
 | SO-30B-MIX | `configs/so30b_mix.yaml` |
 
-Weights are downloaded automatically from Hugging Face. To use local copies,
-pass `--checkpoint-dir` for the Spatial-Omni release and `--base-model` for the base
-model. Keep each adaptation checkpoint beside its `train_args.json`.
+Weights are downloaded automatically from Hugging Face. To use local copies, pass `--checkpoint-dir` for the Spatial-Omni release and `--base-model` for the base model. Keep each adaptation checkpoint beside its `train_args.json`.
 
-Input must be 16 kHz FOA with four channels and W in channel 0. The model uses
-the first 20 seconds. Coordinates follow DCASE: +x front, +y left, +z up.
+Input must be 16 kHz FOA with four channels and W in channel 0. The model uses the first 20 seconds. Coordinates follow DCASE: +x front, +y left, +z up.
 
-For mono recordings, use a MIX config and add `--mono`. SO-7B uses learned null
-spatial tokens; SO-30B uses zero spatial tokens, matching its released evaluation
-path.
+For mono recordings, use a MIX config and add `--mono`. SO-7B uses learned null spatial tokens; SO-30B uses zero spatial tokens, matching its released evaluation path.
 
 ## Batch inference
 
-Prepare a JSONL file with `qa_id` (or `id`), `audio_path`, and `question`. A `prompt`
-field can include answer choices and takes precedence over `question`.
+Prepare a JSONL file with `qa_id` (or `id`), `audio_path`, and `question`. A `prompt` field can include answer choices and takes precedence over `question`.
 
 ~~~bash
 python evaluate.py --config configs/so7b.yaml \
@@ -72,15 +63,11 @@ python evaluate.py --config configs/so7b.yaml \
   --output outputs/predictions.jsonl
 ~~~
 
-Predictions retain the input records and add a `prediction` field. Use
-`--dry-run` to check the inputs, or `--limit 0` to process the full manifest.
-Output paths must be new; completed predictions remain available if a run fails.
+Predictions retain the input records and add a `prediction` field. Use `--dry-run` to check the inputs, or `--limit 0` to process the full manifest. Output paths must be new; completed predictions remain available if a run fails.
 
 ## License and citation
 
-Code is licensed under Apache-2.0, with third-party notices in [NOTICE](NOTICE).
-Spatial-Omni weights use CC-BY-NC-SA-4.0. Base models and datasets retain their
-respective licenses.
+Code is licensed under Apache-2.0, with third-party notices in [NOTICE](NOTICE). Spatial-Omni weights use CC-BY-NC-SA-4.0. Base models and datasets retain their respective licenses.
 
 ~~~bibtex
 @misc{zhu2026spatialomnispatialaudiounderstanding,
